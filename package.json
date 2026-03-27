@@ -1,0 +1,19 @@
+{
+  "name": "attendance-service",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "node-cron": "^4.2.1",
+    "node-zklib": "^1.3.0",
+    "pg": "^8.19.0",
+    "zkteco-js": "^1.7.1"
+  }
+}
