@@ -1,5 +1,6 @@
 require("dotenv").config();
 const ZKLib = require("zkteco-js");
+const { Pool } = require("pg");
 
 /* =========================
    CONFIG
@@ -7,8 +8,6 @@ const ZKLib = require("zkteco-js");
 
 const DEVICE_IP = process.env.DEVICE_IP;
 const DEVICE_PORT = parseInt(process.env.DEVICE_PORT);
-
-const API_URL = process.env.API_URL;
 
 const SYNC_INTERVAL = 60000; // 1 phút
 const AGG_INTERVAL = 300000; // 5 phút
@@ -45,6 +44,14 @@ const device = new ZKLib(DEVICE_IP, DEVICE_PORT, 10000, 4000);
 let isDeviceConnected = false;
 
 /* =========================
+   DB
+========================= */
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+/* =========================
    UTILS
 ========================= */
 
@@ -72,43 +79,33 @@ async function connectDevice() {
 }
 
 /* =========================
-   DEVICE SYNC STATE API
+   LAST SN
 ========================= */
 
 async function getLastSn() {
-  try {
-    const res = await fetch(
-      `${API_URL}/api/attendance/device-sync-state?deviceIp=${DEVICE_IP}`,
-    );
+  const { rows } = await pool.query(
+    `SELECT last_sn FROM device_sync_state WHERE device_ip = $1`,
+    [DEVICE_IP],
+  );
 
-    const data = await res.json();
-
-    return data.lastSn || 0;
-  } catch (err) {
-    console.log("getLastSn error:", err.message);
-    return 0;
-  }
+  if (!rows.length) return 0;
+  return rows[0].last_sn;
 }
 
 async function updateLastSn(sn) {
-  try {
-    await fetch(`${API_URL}/api/attendance/device-sync-state`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        deviceIp: DEVICE_IP,
-        lastSn: sn,
-      }),
-    });
-  } catch (err) {
-    console.log("updateLastSn error:", err.message);
-  }
+  await pool.query(
+    `INSERT INTO device_sync_state (device_ip, last_sn)
+     VALUES ($1,$2)
+     ON CONFLICT (device_ip)
+     DO UPDATE SET
+       last_sn = EXCLUDED.last_sn,
+       updated_at = NOW()`,
+    [DEVICE_IP, sn],
+  );
 }
 
 /* =========================
-   SYNC ATTENDANCE → API
+   SYNC ATTENDANCE
 ========================= */
 
 async function syncAttendance() {
@@ -131,33 +128,36 @@ async function syncAttendance() {
 
     if (!newLogs.length) return;
 
-    const payload = [];
+    const values = [];
+    const placeholders = [];
+    let index = 1;
 
     for (const log of newLogs) {
       const recordTimeUTC = toUTC(log.record_time);
 
-      payload.push({
-        deviceSn: log.sn,
-        userId: log.user_id,
-        recordTime: recordTimeUTC,
-        verifyType: log.type,
-        status: log.state,
-        deviceIp: log.ip,
-      });
+      values.push(
+        log.sn,
+        log.user_id,
+        recordTimeUTC,
+        log.type,
+        log.state,
+        log.ip,
+      );
+
+      placeholders.push(
+        `($${index++},$${index++},$${index++},$${index++},$${index++},$${index++})`,
+      );
 
       if (log.sn > maxSn) maxSn = log.sn;
     }
 
-    // gọi API sync
-    await fetch(`${API_URL}/api/attendance/sync`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        logs: payload,
-      }),
-    });
+    await pool.query(
+      `INSERT INTO attendance_logs
+      (device_sn,user_id,record_time,verify_type,status,device_ip)
+      VALUES ${placeholders.join(",")}
+      ON CONFLICT (device_ip,device_sn) DO NOTHING`,
+      values,
+    );
 
     await updateLastSn(maxSn);
 
@@ -170,36 +170,79 @@ async function syncAttendance() {
 }
 
 /* =========================
-   AGGREGATE → API
+   AGGREGATE DAILY
 ========================= */
 
 async function aggregateDaily() {
   try {
-    await fetch(`${API_URL}/api/attendance/aggregate`, {
-      method: "POST",
-    });
+    await pool.query(`
+      INSERT INTO attendance_daily
+      (user_id, work_date, check_in, check_out)
 
-    console.log("Aggregate done");
+      SELECT
+        user_id,
+        work_date,
+        MIN(record_time) AS check_in,
+        CASE
+          WHEN COUNT(*) > 1 THEN MAX(record_time)
+          ELSE NULL
+        END AS check_out
+
+      FROM (
+        SELECT
+          user_id,
+          record_time,
+          (record_time AT TIME ZONE 'Asia/Ho_Chi_Minh')::date AS work_date
+        FROM attendance_logs
+      ) t
+
+      WHERE work_date = (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
+
+      GROUP BY user_id, work_date
+
+      ON CONFLICT (user_id, work_date)
+      DO UPDATE SET
+        check_in = LEAST(attendance_daily.check_in, EXCLUDED.check_in),
+        check_out = GREATEST(attendance_daily.check_out, EXCLUDED.check_out),
+        updated_at = NOW()
+    `);
+
+    console.log("Daily attendance aggregated");
   } catch (err) {
     console.log("Aggregate error:", err.message);
   }
 }
 
 /* =========================
-   NOTIFY → API
+   NOTIFY JOBS
 ========================= */
 
-async function notifyCheckIn() {
+let lastRunCheckIn = null;
+let lastRunCheckOut = null;
+
+async function notifyNoCheckInOrLate() {
   try {
-    const res = await fetch(`${API_URL}/api/attendance/notify-checkin`, {
-      method: "POST",
-    });
+    const { rows } = await pool.query(`
+      SELECT u."fullName"
+      FROM users u
+      LEFT JOIN attendance_daily a
+        ON u.code = a.user_id
+        AND a.work_date = (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
+      WHERE
+        u.active = true
+        AND u.code IS NOT NULL
+        AND u.code <> ''
+        AND (
+          a.check_in IS NULL
+          OR (a.check_in AT TIME ZONE 'Asia/Ho_Chi_Minh')::time > '09:05:59'
+        )
+    `);
 
-    const data = await res.json();
+    if (!rows.length) return;
 
-    if (data?.message) {
-      await sendTelegram(data.message);
-    }
+    const list = rows.map((r) => `- ${r.fullName}`).join("\n");
+
+    await sendTelegram(`🚨 Chưa check-in / đi muộn:\n${list}`);
 
     console.log("Notify check-in sent");
   } catch (err) {
@@ -207,46 +250,37 @@ async function notifyCheckIn() {
   }
 }
 
-async function notifyCheckOut() {
+async function notifyNoCheckOut() {
   try {
-    const res = await fetch(`${API_URL}/api/attendance/notify-checkout`, {
-      method: "POST",
-    });
+    const { rows } = await pool.query(`
+      SELECT u."fullName"
+      FROM users u
+      LEFT JOIN attendance_daily a
+        ON u.code = a.user_id
+        AND a.work_date = (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
+      WHERE
+        u.active = true
+        AND u.code IS NOT NULL
+        AND u.code <> ''
+        AND a.user_id IS NOT NULL
+        AND a.check_out IS NULL
+    `);
 
-    const data = await res.json();
+    if (!rows.length) return;
 
-    if (data?.message) {
-      await sendTelegram(data.message);
-    }
+    const list = rows.map((r) => `- ${r.fullName}`).join("\n");
 
-    console.log("Notify check-out sent");
+    await sendTelegram(`⚠️ Chưa checkout:\n${list}`);
+
+    console.log("Notify checkout sent");
   } catch (err) {
     console.log("Notify error:", err.message);
   }
 }
 
 /* =========================
-   OPTIONAL: REBUILD
-========================= */
-
-async function rebuildAll() {
-  try {
-    await fetch(`${API_URL}/api/attendance/rebuild`, {
-      method: "POST",
-    });
-
-    console.log("Rebuild done");
-  } catch (err) {
-    console.log("Rebuild error:", err.message);
-  }
-}
-
-/* =========================
    SCHEDULER
 ========================= */
-
-let lastRunCheckIn = null;
-let lastRunCheckOut = null;
 
 function scheduleJobs() {
   setInterval(() => {
@@ -260,16 +294,16 @@ function scheduleJobs() {
     const minute = vn.getMinutes();
     const todayKey = vn.toDateString();
 
-    // 09:15 (check-in)
+    // 12:00
     if (hour === 9 && minute === 15 && lastRunCheckIn !== todayKey) {
       lastRunCheckIn = todayKey;
-      notifyCheckIn();
+      notifyNoCheckInOrLate();
     }
 
-    // 18:10 (check-out)
+    // 18:05
     if (hour === 18 && minute === 10 && lastRunCheckOut !== todayKey) {
       lastRunCheckOut = todayKey;
-      notifyCheckOut();
+      notifyNoCheckOut();
     }
   }, 60000);
 }
@@ -287,9 +321,6 @@ async function start() {
   setInterval(aggregateDaily, AGG_INTERVAL);
 
   scheduleJobs();
-
-  // OPTIONAL: chạy rebuild 1 lần khi start
-  // await rebuildAll();
 }
 
 start();
